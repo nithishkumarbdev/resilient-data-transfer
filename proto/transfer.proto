@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package filetransfer;
+
+option java_package = "com.nithish.filetransfer.proto";
+option java_multiple_files = true;
+
+// Sent once, before any chunks, so the receiver knows what to expect
+// and can pre-allocate the output file at the correct size.
+message FileMetadata {
+  string transfer_id = 1;
+  string filename = 2;
+  int64 total_size = 3;
+  int32 total_chunks = 4;
+  string file_checksum = 5; // SHA-256 hex digest of the whole file
+}
+
+// One slice of the file. sequence_number lets the receiver place it at
+// the right offset even if chunks ever arrive out of order (this is
+// what Phase 3's WAL-based resume will lean on).
+message FileChunk {
+  string transfer_id = 1;
+  int32 sequence_number = 2;
+  bytes data = 3;
+  string chunk_checksum = 4; // SHA-256 hex digest of this chunk's data only
+}
+
+// Every frame on the wire is one of these. A `oneof` in protobuf means
+// exactly one of the listed fields is set per message — this is how we
+// carry two different message shapes (metadata vs. chunk) over a single
+// stream without needing a separate "message type" byte of our own.
+message TransferMessage {
+  oneof payload {
+    FileMetadata metadata = 1;
+    FileChunk chunk = 2;
+  }
+}
