@@ -25,13 +25,68 @@ message FileChunk {
   string chunk_checksum = 4; // SHA-256 hex digest of this chunk's data only
 }
 
+// Sent by the client as the FIRST message on a reconnect, instead of
+// FileMetadata, when it already has a transfer_id from an earlier
+// attempt (e.g. the previous connection died because the server
+// crashed mid-transfer).
+message ResumeRequest {
+  string transfer_id = 1;
+}
+
+// last_committed_sequence = -1 means the server has no record of this
+// transfer_id at all (e.g. it crashed before ever durably logging the
+// FileMetadata) — the client should restart the transfer from scratch.
+// Any other value means "chunks 0..N are safely committed; send N+1 onward."
+message ResumeResponse {
+  string transfer_id = 1;
+  int32 last_committed_sequence = 2;
+}
+
 // Every frame on the wire is one of these. A `oneof` in protobuf means
 // exactly one of the listed fields is set per message — this is how we
-// carry two different message shapes (metadata vs. chunk) over a single
-// stream without needing a separate "message type" byte of our own.
+// carry several different message shapes over a single stream without
+// needing a separate "message type" byte of our own.
 message TransferMessage {
   oneof payload {
     FileMetadata metadata = 1;
     FileChunk chunk = 2;
+    ResumeRequest resume_request = 3;
+    ResumeResponse resume_response = 4;
+  }
+}
+
+// ---------------------------------------------------------------------
+// Internal WAL entry schema. These are never sent over the network —
+// they're the structured payloads we hand to the generic WalWriter's
+// append(byte[]) so the low-level durable log doesn't need to know
+// anything about transfers or chunks.
+// ---------------------------------------------------------------------
+
+// Durable record of a transfer's metadata. Without this, a restarted
+// server wouldn't know the filename/size/expected checksum for a
+// transfer that was still in progress when it crashed.
+message WalTransferStart {
+  string transfer_id = 1;
+  string filename = 2;
+  int64 total_size = 3;
+  int32 total_chunks = 4;
+  string file_checksum = 5;
+}
+
+// Written only after a chunk's bytes are durably applied to the
+// destination file — this is the sole durability signal recovery
+// trusts. See README for why there's no separate "received" state.
+message WalChunkCommitted {
+  string transfer_id = 1;
+  int32 sequence_number = 2;
+  int64 file_offset = 3;
+  int32 chunk_length = 4;
+  string chunk_checksum = 5;
+}
+
+message WalEntry {
+  oneof entry {
+    WalTransferStart transfer_start = 1;
+    WalChunkCommitted chunk_committed = 2;
   }
 }

@@ -105,7 +105,7 @@ class TransferIntegrationTest {
         waitForResult();
 
         assertFalse(server.getLastResult().success);
-        assertTrue(server.getLastResult().message.contains("Checksum mismatch"),
+        assertTrue(server.getLastResult().message.contains("checksum mismatch"),
                 "Expected a checksum-mismatch failure, got: " + server.getLastResult().message);
     }
 
