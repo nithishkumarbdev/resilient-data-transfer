@@ -293,3 +293,184 @@ Also verified directly:
   name that they aren't atomic together if asked.
 - No authentication, no encryption, no distributed coordination — single
   node, local filesystem, as expected at this phase.
+
+---
+
+## Phase 3 — File Integrity Monitoring
+
+Adds a File Integrity Monitoring (FIM) component that watches a directory
+for unexpected changes, independent of the transfer/WAL system from
+Phases 1–2.
+
+### Transfer checksum vs. file integrity monitoring — not the same thing
+
+- **Transfer checksum** (Phases 1–2): "did this chunk/file arrive
+  correctly over the network?" Answered once, at transfer completion.
+- **File integrity monitoring** (this phase): "has this file changed
+  compared to its last known trusted state?" An ongoing question, asked
+  every time the filesystem reports a change, for as long as the monitor
+  runs.
+
+They share one thing on purpose: both use `ChecksumUtils.sha256Hex(...)`.
+There's no second SHA-256 implementation anywhere in this project.
+
+### Architecture
+
+```text
+Filesystem (java.nio.file.WatchService)
+        |
+        v
+Change detected (CREATE / MODIFY / DELETE)
+        |
+        v
+Debounce (250ms, coalesces a burst of events for one path into one check)
+        |
+        v
+"Known transfer activity" filter -- suppressed if TransferServer marked this path active
+        |
+        v
+SHA-256 the file, compare against BaselineManager
+        |
+        v
+IntegrityEvent (FILE_CREATED / FILE_MODIFIED / FILE_DELETED)
+        |
+        v
+IntegrityEventStore (append-only log, outputDir/integrity-events.log)
+```
+
+### New components
+
+- **`integrity/BaselineManager`** — persisted map of path → {sha256, size,
+  last_verified}, stored at `outputDir/integrity-baseline.txt`. Two
+  distinct entry points, on purpose: `createBaseline(root, ...)` is the
+  explicit "trust whatever's on disk right now" operation; `load(...)` is
+  the normal restart path and never implicitly trusts new content.
+- **`integrity/IntegrityEventStore`** — append-only event log at
+  `outputDir/integrity-events.log`. The audit trail Phase 4's API will
+  eventually expose.
+- **`integrity/IntegrityEvent`**, **`IntegrityEventType`** — three event
+  types (`FILE_CREATED`/`FILE_MODIFIED`/`FILE_DELETED`), not four --
+  see the javadoc on `IntegrityEventType` for why a separate
+  `INTEGRITY_VIOLATION` type would be redundant here.
+- **`integrity/FileIntegrityMonitor`** — the watcher itself: recursive
+  `WatchService` registration, debounce, startup reconciliation, and the
+  known-transfer-activity suppression described below.
+- **`TransferServer`** — gained an optional `FileIntegrityMonitor` field
+  (nullable; a plain `new TransferServer(port, dir)` still works exactly
+  as before) and calls `markTransferActive`/`markTransferComplete` at the
+  right points in the transfer lifecycle.
+
+### How legitimate transfers avoid triggering false violations
+
+This is the part of Phase 3 that actually required design thought, not
+just plumbing. `TransferServer` writes to a destination file many times
+per transfer (once per chunk). Without an explicit signal, every one of
+those writes is indistinguishable from tampering.
+
+```text
+handleNewTransfer() creates/pre-allocates the output file
+        |
+        v
+fim.markTransferActive(path)   -- FIM now suppresses checks on this path entirely
+        |
+        v
+... chunks arrive, file is written to repeatedly ...
+        |
+        v
+transfer completes, whole-file SHA-256 verified
+        |
+        v
+fim.markTransferComplete(path, verifiedHash, size)
+        |
+        +--> removes the suppression
+        +--> updates the baseline to the VERIFIED hash directly
+             (not re-derived from a filesystem event)
+```
+
+If a transfer ends without a verified checksum (failure/incomplete),
+`unmarkTransferActive()` removes the suppression without touching the
+baseline -- an unverified file never becomes trusted.
+
+A file's baseline is otherwise **never** auto-updated just because a
+modification was detected. An unexplained hash change stays flagged
+until something explicit says otherwise (a verified transfer, or a
+fresh `createBaseline()`). Silently trusting every change would defeat
+the point of the feature.
+
+### Reconciliation on startup
+
+`WatchService` events aren't a durable log -- if the monitor wasn't
+running, it saw nothing. On `start()`, before watching begins,
+`reconcile()` walks the current filesystem against the baseline and
+reports anything that drifted while nobody was watching (created,
+modified, or deleted). This was proven in practice during the Phase 2
+regression re-test: a file left partially-written by a killed server
+process was correctly picked up by reconciliation as a new baseline
+entry, then correctly suppressed again once the resumed transfer's
+writes continued against it.
+
+### Configuration
+
+The monitored root is whatever directory the server was told to write
+transfers into -- baseline and event log live alongside it
+(`outputDir/integrity-baseline.txt`, `outputDir/integrity-events.log`).
+No separate config file; the existing `<port> <outputDir>` CLI arguments
+are enough. `transfer.wal` and FIM's own two files are excluded from
+monitoring by filename, since they're the system's own operational
+state, not transferred content.
+
+### Real tests executed (JUnit 5, run via junit-platform-console-standalone)
+
+All 10 of the required scenarios, plus a full regression run of every
+earlier test:
+
+```text
+23 tests found, 23 successful, 0 failed
+(WalTest: 4, FileIntegrityMonitorTest: 10, ResumeAndRecoveryTest: 3, TransferIntegrationTest: 6)
+```
+
+The FIM-specific tests, and what the captured log output actually showed:
+
+- **Baseline creation** — hashes match `ChecksumUtils.sha256Hex` directly.
+- **Unchanged file** — zero events generated.
+- **Modification** — one `FILE_MODIFIED` event, correct path.
+- **Deletion** — one `FILE_DELETED` event, baseline entry removed.
+- **New file** — one `FILE_CREATED` event, file added to baseline.
+- **Same filename, changed content** — hash comparison catches it; baseline
+  correctly still holds the *old* hash until something explicit updates it.
+- **Legitimate transfer** (the important one) — ran a real transfer through
+  `TransferServer` with FIM attached. Log output showed
+  `Known transfer activity: .../legit.bin (FIM checks suppressed until complete)`
+  at the start, zero `FILE_MODIFIED` events during any of the 8 chunk
+  writes, and `Baseline updated after verified transfer: .../legit.bin`
+  at the end -- exactly the intended behavior, not just an assertion that
+  happened to pass.
+- **Baseline persistence** — a second, independent `BaselineManager`
+  instance loading the same file sees the same entries.
+- **Event persistence** — a second, independent `IntegrityEventStore`
+  instance loading the same file sees the same events.
+- **Multiple files, one modified** — exactly one event, for the right file.
+
+Also re-ran the standalone real `kill -9` test from Phase 2, this time
+through the actual `TransferServer.main()` entrypoint (which now starts
+FIM automatically) to confirm the two systems coexist correctly under a
+real crash -- resume completed, final SHA-256 matched, and the log
+showed FIM correctly reconciling the partially-written file from the
+killed process as a new baseline entry before suppressing it again once
+the resumed writes continued.
+
+### Known limitations
+
+- Baseline and event log are plain rewrite-whole-file-on-update / plain
+  append text formats -- fine at this scale, would need something more
+  structured (or at least indexed) if the monitored directory grew large.
+- `WatchService` behavior (especially around editors' save patterns) is
+  somewhat OS/filesystem dependent; the 250ms debounce is a simple fixed
+  window, not adaptive.
+- No cryptographic signing of the baseline or event log -- someone with
+  filesystem access to the server could edit `integrity-baseline.txt`
+  directly and the monitor would trust it. Acceptable for this phase;
+  would matter for a real security-monitoring product.
+- Reconciliation is a full directory walk on every startup -- fine at
+  this scale, would need to be bounded or incremental for a very large
+  monitored tree.

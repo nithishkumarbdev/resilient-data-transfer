@@ -1,5 +1,6 @@
 package com.nithish.filetransfer;
 
+import com.nithish.filetransfer.integrity.FileIntegrityMonitor;
 import com.nithish.filetransfer.proto.FileChunk;
 import com.nithish.filetransfer.proto.FileMetadata;
 import com.nithish.filetransfer.proto.ResumeRequest;
@@ -26,6 +27,7 @@ public class TransferServer {
     private final int port;
     private final Path outputDir;
     private final Path walPath;
+    private final FileIntegrityMonitor fim; // nullable -- FIM is optional
 
     private ServerSocket serverSocket;
     private Thread acceptThread;
@@ -34,9 +36,14 @@ public class TransferServer {
     private volatile TransferResult lastResult;
 
     public TransferServer(int port, Path outputDir) {
+        this(port, outputDir, null);
+    }
+
+    public TransferServer(int port, Path outputDir, FileIntegrityMonitor fim) {
         this.port = port;
         this.outputDir = outputDir;
         this.walPath = outputDir.resolve("transfer.wal");
+        this.fim = fim;
     }
 
     public static class TransferResult {
@@ -62,6 +69,9 @@ public class TransferServer {
             for (TransferState s : transfers.values()) {
                 System.out.printf("  transfer_id=%s  %d/%d chunks contiguous-committed%n",
                         s.transferId, s.highestContiguousCommitted() + 1, s.totalChunks);
+                if (fim != null && !s.isComplete()) {
+                    fim.markTransferActive(s.outputPath); // resumed writes are about to land on this path
+                }
             }
         }
 
@@ -163,6 +173,9 @@ public class TransferServer {
         try (RandomAccessFile file = new RandomAccessFile(outputPath.toFile(), "rw")) {
             file.setLength(metadata.getTotalSize()); // pre-allocate to final size
         }
+        if (fim != null) {
+            fim.markTransferActive(outputPath);
+        }
 
         WalTransferStart walStart = WalTransferStart.newBuilder()
                 .setTransferId(metadata.getTransferId())
@@ -246,6 +259,13 @@ public class TransferServer {
         if (state.isComplete()) {
             String actualFileChecksum = ChecksumUtils.sha256Hex(state.outputPath);
             boolean match = actualFileChecksum.equals(state.fileChecksum);
+            if (fim != null) {
+                if (match) {
+                    fim.markTransferComplete(state.outputPath, actualFileChecksum, state.totalSize);
+                } else {
+                    fim.unmarkTransferActive(state.outputPath); // done, but don't trust this hash into the baseline
+                }
+            }
             return new TransferResult(match,
                     match ? "integrity check passed (" + state.filename + ")"
                           : "integrity check FAILED -- file checksum mismatch on " + state.filename,
@@ -264,7 +284,13 @@ public class TransferServer {
             System.err.println("Usage: TransferServer <port> <outputDir>");
             System.exit(1);
         }
-        TransferServer server = new TransferServer(Integer.parseInt(args[0]), Path.of(args[1]));
+        Path outputDir = Path.of(args[1]);
+        java.util.Set<String> excluded = java.util.Set.of("transfer.wal", "integrity-baseline.txt", "integrity-events.log");
+        FileIntegrityMonitor fim = FileIntegrityMonitor.withExistingBaseline(
+                outputDir, outputDir.resolve("integrity-baseline.txt"), outputDir.resolve("integrity-events.log"), excluded);
+        fim.start();
+
+        TransferServer server = new TransferServer(Integer.parseInt(args[0]), outputDir, fim);
         server.start();
         System.out.println("Receiver listening on port " + args[0] + ", writing to " + args[1]);
         Thread.currentThread().join();
