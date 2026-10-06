@@ -42,19 +42,9 @@ public final class WalWriter implements AutoCloseable {
     private final AtomicLong nextSequenceNumber = new AtomicLong(0);
 
     public WalWriter(Path walFile, FlushPolicy flushPolicy) throws IOException {
-        // Read the existing records first (before opening for write) so the
-        // sequence counter continues correctly across a restart, instead of
-        // colliding with numbers already on disk from a previous run.
-        long existingCount = countExisting(walFile);
-
         this.file = new RandomAccessFile(walFile.toFile(), "rw");
         this.file.seek(this.file.length()); // resume appending after whatever's already there
         this.flushPolicy = flushPolicy;
-        this.nextSequenceNumber.set(existingCount);
-    }
-
-    private static long countExisting(Path walFile) throws IOException {
-        return WalReader.replay(walFile).size();
     }
 
     /** Appends payload durably (per flush policy) and returns the sequence number it was assigned. */
