@@ -80,7 +80,7 @@ mvn test
 
 Terminal 1 (receiver):
 ```bash
-mvn compile exec:java -Dexec.mainClass="com.nithish.filetransfer.TransferServer" -Dexec.args="9000 /tmp/received"
+mvn compile exec:java -Dexec.mainClass="com.nithish.filetransfer.TransferServer" -Dexec.args="9000 /tmp/received 8080"
 ```
 
 Terminal 2 (sender):
@@ -136,3 +136,482 @@ Both hashes should match.
 
 WAL, crash recovery/resume, retry/ACK logic, UDP, the HTTP management
 layer, TLS, and CloudWatch. Those are Phases 2–5.
+
+---
+
+## Phase 2 — WAL + Crash Recovery
+
+Extends Phase 1 (unchanged) with durability and resume: a server that can be
+killed mid-transfer, restarted, and continue exactly where it left off, with
+no corruption and no duplication.
+
+### What's new
+
+- **`proto/transfer.proto`** — added `ResumeRequest`/`ResumeResponse` to the
+  network `TransferMessage` oneof, and a separate `WalEntry` oneof
+  (`WalTransferStart`, `WalChunkCommitted`) for internal WAL payloads. WAL
+  entries are never sent over the network; they're just a convenient,
+  already-available serialization for the generic `WalWriter.append(byte[])`.
+- **`wal/WalWriter`, `wal/WalReader`, `wal/WalRecord`** — the generic,
+  transfer-agnostic durable log from the earlier step (unchanged, except
+  `WalWriter` now correctly continues its sequence counter across a restart
+  instead of resetting to 0).
+- **`TransferState`** — per-transfer in-memory state: which chunks are
+  committed, and the resume point (**highest contiguous committed chunk**,
+  not the highest chunk number seen — see below).
+- **`RecoveryManager`** — replays the WAL at startup and rebuilds the same
+  `TransferState` a live server would have accumulated. This *is* the whole
+  recovery algorithm; there's no separate repair pass.
+- **`TransferServer`** — rewritten to hold transfer state in a
+  `Map<transfer_id, TransferState>` that survives across connections and is
+  rebuilt from the WAL at startup, to branch on `FileMetadata` vs.
+  `ResumeRequest` as the first message on a connection, and to treat a
+  chunk as committed only after it's durably written.
+- **`TransferClient.sendFileWithResume(...)`** — reconnects on failure, asks
+  the server where it actually got to via `ResumeRequest`, and continues
+  from the next required chunk. The original `sendFile(...)` is untouched
+  and still used by the plain Phase 1 tests.
+
+### Durability boundary — what "committed" actually means
+
+```text
+receive FileChunk over TCP
+        |
+        v
+validate transfer_id + checksum
+        |
+        v
+write chunk bytes to destination file at (sequence_number * chunk_size), fsync
+        |
+        v
+append WalChunkCommitted to WAL, fsync   <-- this line returning is the
+        |                                    durability boundary
+        v
+mark chunk committed in TransferState
+```
+
+A chunk only counts as committed once its `WalChunkCommitted` record is
+durably on disk. Nothing before that line is trusted after a crash.
+
+### Why there's no separate "PREPARED" / "RECEIVED" WAL state
+
+The obvious two-phase design would log a chunk as "received" before writing
+it to the destination file, then "committed" after. This project
+deliberately uses **one** durable state instead, for a concrete reason: the
+recovery strategy always treats "no durable `WalChunkCommitted` record" as
+"ask the client to resend this chunk," and rewriting a chunk at its exact
+offset is idempotent. So a chunk that crashed mid-file-write behaves
+*identically*, from recovery's point of view, to a chunk that was never
+sent — both get re-requested and safely reapplied. A two-phase design would
+require storing the chunk's raw bytes inside the WAL (to redo the file write
+during recovery without the network), which this design avoids entirely.
+
+### Resume handshake
+
+```text
+Client reconnects
+     |
+     v
+ResumeRequest { transfer_id }
+     |
+     v
+Server looks up transfer_id in its (WAL-rebuilt) state map
+     |
+     v
+ResumeResponse { last_committed_sequence }
+     -1  -> server has no record of this transfer; client restarts from FileMetadata
+     N   -> client resumes sending from chunk N+1
+```
+
+### Crash recovery, end to end
+
+```text
+Server startup
+     |
+     v
+WalReader.replay(wal file)     -- stops cleanly at any truncated/corrupted tail
+     |
+     v
+RecoveryManager rebuilds Map<transfer_id, TransferState>
+     |
+     v
+Server ready -- a ResumeRequest for a known transfer_id now gets a real answer
+```
+
+### Real test performed (not simulated)
+
+Ran an actual `kill -9` against a separate server process mid-transfer, in
+this environment, and captured the logs:
+
+- Started `TransferServer` as its own OS process.
+- Started a resumable client sending a 2,000,000-byte file (31 chunks), with
+  a small artificial per-chunk delay so the crash window was reproducible
+  rather than a timing race.
+- After 6 chunks committed, sent `SIGKILL` (`kill -9`) directly to the
+  server process — not a graceful shutdown.
+- Restarted the server against the same output directory. It logged:
+  `Recovered 1 transfer(s) from WAL: ... 6/31 chunks contiguous-committed`.
+- The client's in-flight write failed with `Broken pipe`, retried with
+  backoff, got `Connection refused` a few times while the server was down,
+  then reconnected once it was back up and received
+  `last_committed_sequence=5`.
+- It resumed sending from chunk 6 through 30. Final result:
+  `Transfer OK: integrity check passed (bigfile.bin)`.
+- `sha256sum` of the original and reconstructed file matched exactly.
+
+Also verified directly:
+- A fresh server with no existing WAL starts cleanly (no recovered transfers).
+- Sending the same chunk three times in a row (simulated retransmission)
+  results in one commit and two `Duplicate chunk ignored` log lines — final
+  file is the correct size and checksum, not corrupted or tripled.
+
+### Fsync / durability policy (current, simple version)
+
+- **WAL**: `WalWriter.FlushPolicy.EVERY_RECORD` — every WAL append calls
+  `FileDescriptor.sync()` before returning. Safest, and simple to reason
+  about; the cost is one fsync per chunk, which is fine at this scale.
+- **Destination file**: also fsynced after every chunk write, for the same
+  reason. This is more conservative than strictly necessary (the file write
+  isn't the durability boundary, the WAL append is) but keeps the two
+  writes close together in practice and is simple to explain.
+- Not implemented: a configurable "fsync every N records / every T ms"
+  policy. The reference log-streaming project used one; this project keeps
+  a single fixed policy for now and documents the tradeoff instead of
+  building the configurability, per the "don't overengineer this phase"
+  guidance.
+
+### Known limitations
+
+- Single WAL file, no segment rotation — acceptable at this scale; would
+  need rollover if a transfer ran long enough to make one file unwieldy.
+- The server handles one connection at a time (the accept loop is
+  sequential, not per-connection-threaded) — fine for the resume/crash
+  scenario this phase targets, not a concurrent-multi-client server yet.
+- Destination file writes and WAL appends are two separate fsyncs, not one
+  atomic operation — a crash between them is still handled correctly (see
+  the "no PREPARED state" reasoning above), but it's worth being able to
+  name that they aren't atomic together if asked.
+- No authentication, no encryption, no distributed coordination — single
+  node, local filesystem, as expected at this phase.
+
+---
+
+## Phase 3 — File Integrity Monitoring
+
+Adds a File Integrity Monitoring (FIM) component that watches a directory
+for unexpected changes, independent of the transfer/WAL system from
+Phases 1–2.
+
+### Transfer checksum vs. file integrity monitoring — not the same thing
+
+- **Transfer checksum** (Phases 1–2): "did this chunk/file arrive
+  correctly over the network?" Answered once, at transfer completion.
+- **File integrity monitoring** (this phase): "has this file changed
+  compared to its last known trusted state?" An ongoing question, asked
+  every time the filesystem reports a change, for as long as the monitor
+  runs.
+
+They share one thing on purpose: both use `ChecksumUtils.sha256Hex(...)`.
+There's no second SHA-256 implementation anywhere in this project.
+
+### Architecture
+
+```text
+Filesystem (java.nio.file.WatchService)
+        |
+        v
+Change detected (CREATE / MODIFY / DELETE)
+        |
+        v
+Debounce (250ms, coalesces a burst of events for one path into one check)
+        |
+        v
+"Known transfer activity" filter -- suppressed if TransferServer marked this path active
+        |
+        v
+SHA-256 the file, compare against BaselineManager
+        |
+        v
+IntegrityEvent (FILE_CREATED / FILE_MODIFIED / FILE_DELETED)
+        |
+        v
+IntegrityEventStore (append-only log, outputDir/integrity-events.log)
+```
+
+### New components
+
+- **`integrity/BaselineManager`** — persisted map of path → {sha256, size,
+  last_verified}, stored at `outputDir/integrity-baseline.txt`. Two
+  distinct entry points, on purpose: `createBaseline(root, ...)` is the
+  explicit "trust whatever's on disk right now" operation; `load(...)` is
+  the normal restart path and never implicitly trusts new content.
+- **`integrity/IntegrityEventStore`** — append-only event log at
+  `outputDir/integrity-events.log`. The audit trail Phase 4's API will
+  eventually expose.
+- **`integrity/IntegrityEvent`**, **`IntegrityEventType`** — three event
+  types (`FILE_CREATED`/`FILE_MODIFIED`/`FILE_DELETED`), not four --
+  see the javadoc on `IntegrityEventType` for why a separate
+  `INTEGRITY_VIOLATION` type would be redundant here.
+- **`integrity/FileIntegrityMonitor`** — the watcher itself: recursive
+  `WatchService` registration, debounce, startup reconciliation, and the
+  known-transfer-activity suppression described below.
+- **`TransferServer`** — gained an optional `FileIntegrityMonitor` field
+  (nullable; a plain `new TransferServer(port, dir)` still works exactly
+  as before) and calls `markTransferActive`/`markTransferComplete` at the
+  right points in the transfer lifecycle.
+
+### How legitimate transfers avoid triggering false violations
+
+This is the part of Phase 3 that actually required design thought, not
+just plumbing. `TransferServer` writes to a destination file many times
+per transfer (once per chunk). Without an explicit signal, every one of
+those writes is indistinguishable from tampering.
+
+```text
+handleNewTransfer() creates/pre-allocates the output file
+        |
+        v
+fim.markTransferActive(path)   -- FIM now suppresses checks on this path entirely
+        |
+        v
+... chunks arrive, file is written to repeatedly ...
+        |
+        v
+transfer completes, whole-file SHA-256 verified
+        |
+        v
+fim.markTransferComplete(path, verifiedHash, size)
+        |
+        +--> removes the suppression
+        +--> updates the baseline to the VERIFIED hash directly
+             (not re-derived from a filesystem event)
+```
+
+If a transfer ends without a verified checksum (failure/incomplete),
+`unmarkTransferActive()` removes the suppression without touching the
+baseline -- an unverified file never becomes trusted.
+
+A file's baseline is otherwise **never** auto-updated just because a
+modification was detected. An unexplained hash change stays flagged
+until something explicit says otherwise (a verified transfer, or a
+fresh `createBaseline()`). Silently trusting every change would defeat
+the point of the feature.
+
+### Reconciliation on startup
+
+`WatchService` events aren't a durable log -- if the monitor wasn't
+running, it saw nothing. On `start()`, before watching begins,
+`reconcile()` walks the current filesystem against the baseline and
+reports anything that drifted while nobody was watching (created,
+modified, or deleted). This was proven in practice during the Phase 2
+regression re-test: a file left partially-written by a killed server
+process was correctly picked up by reconciliation as a new baseline
+entry, then correctly suppressed again once the resumed transfer's
+writes continued against it.
+
+### Configuration
+
+The monitored root is whatever directory the server was told to write
+transfers into -- baseline and event log live alongside it
+(`outputDir/integrity-baseline.txt`, `outputDir/integrity-events.log`).
+No separate config file; the existing `<port> <outputDir>` CLI arguments
+are enough. `transfer.wal` and FIM's own two files are excluded from
+monitoring by filename, since they're the system's own operational
+state, not transferred content.
+
+### Real tests executed (JUnit 5, run via junit-platform-console-standalone)
+
+All 10 of the required scenarios, plus a full regression run of every
+earlier test:
+
+```text
+23 tests found, 23 successful, 0 failed
+(WalTest: 4, FileIntegrityMonitorTest: 10, ResumeAndRecoveryTest: 3, TransferIntegrationTest: 6)
+```
+
+The FIM-specific tests, and what the captured log output actually showed:
+
+- **Baseline creation** — hashes match `ChecksumUtils.sha256Hex` directly.
+- **Unchanged file** — zero events generated.
+- **Modification** — one `FILE_MODIFIED` event, correct path.
+- **Deletion** — one `FILE_DELETED` event, baseline entry removed.
+- **New file** — one `FILE_CREATED` event, file added to baseline.
+- **Same filename, changed content** — hash comparison catches it; baseline
+  correctly still holds the *old* hash until something explicit updates it.
+- **Legitimate transfer** (the important one) — ran a real transfer through
+  `TransferServer` with FIM attached. Log output showed
+  `Known transfer activity: .../legit.bin (FIM checks suppressed until complete)`
+  at the start, zero `FILE_MODIFIED` events during any of the 8 chunk
+  writes, and `Baseline updated after verified transfer: .../legit.bin`
+  at the end -- exactly the intended behavior, not just an assertion that
+  happened to pass.
+- **Baseline persistence** — a second, independent `BaselineManager`
+  instance loading the same file sees the same entries.
+- **Event persistence** — a second, independent `IntegrityEventStore`
+  instance loading the same file sees the same events.
+- **Multiple files, one modified** — exactly one event, for the right file.
+
+Also re-ran the standalone real `kill -9` test from Phase 2, this time
+through the actual `TransferServer.main()` entrypoint (which now starts
+FIM automatically) to confirm the two systems coexist correctly under a
+real crash -- resume completed, final SHA-256 matched, and the log
+showed FIM correctly reconciling the partially-written file from the
+killed process as a new baseline entry before suppressing it again once
+the resumed writes continued.
+
+### Known limitations
+
+- Baseline and event log are plain rewrite-whole-file-on-update / plain
+  append text formats -- fine at this scale, would need something more
+  structured (or at least indexed) if the monitored directory grew large.
+- `WatchService` behavior (especially around editors' save patterns) is
+  somewhat OS/filesystem dependent; the 250ms debounce is a simple fixed
+  window, not adaptive.
+- No cryptographic signing of the baseline or event log -- someone with
+  filesystem access to the server could edit `integrity-baseline.txt`
+  directly and the monitor would trust it. Acceptable for this phase;
+  would matter for a real security-monitoring product.
+- Reconciliation is a full directory walk on every startup -- fine at
+  this scale, would need to be bounded or incremental for a very large
+  monitored tree.
+
+---
+
+## Phase 4 (Part 1–3) — HTTP Management API
+
+Adds a read-only HTTP management/visibility layer. **This is not a second
+transfer protocol** -- binary file transfer still only happens over
+Protobuf/TCP, exactly as in Phases 1–3. HTTP exists purely so a human or
+a script can ask "what's going on" without speaking the wire protocol.
+
+UDP transport and TLS (the rest of Phase 4) are deliberately **not**
+included in this pass -- see "Not yet done" below.
+
+### Why a separate layer, not endpoints bolted onto TransferServer
+
+```text
+HTTP request
+     |
+     v
+ManagementApiServer (JDK com.sun.net.httpserver.HttpServer -- no framework)
+     |
+     v
+reads directly from the SAME live TransferServer / FileIntegrityMonitor
+state the TCP path uses -- no second copy of "API state" to keep in sync
+```
+
+`ManagementApiServer` never touches a socket's raw bytes and
+`TransferServer`/`FileIntegrityMonitor` have no HTTP-awareness at all --
+the boundary is a handful of read-only getters (`getAllTransferStates()`,
+`getTransfersStarted()`, `fim.getBaseline()`, `fim.getEventStore()`, ...).
+
+### Endpoints implemented
+
+| Endpoint | Notes |
+|---|---|
+| `GET /health` | flat `{"status":"ok","uptime_seconds":N}`, matching the spec's own example shape |
+| `GET /server` | state, active connections/transfers, and the real observability counters (Part 10) |
+| `GET /transfers` | every known transfer, status derived from real committed-chunk counts |
+| `GET /transfers/{id}` | 404 for an unknown id; the id segment is validated (see Security) |
+| `GET /integrity/events` | FIM's persisted event log; optional `?type=FILE_MODIFIED` filter, 400 for an unrecognized type |
+| `GET /integrity/files` | FIM's current baseline (path, sha256, size) |
+| `GET /recovery` | recovered-transfer count and current WAL file size |
+
+All other endpoints from the spec (`POST /transfers/{id}/resume`,
+`POST /integrity/rescan`, etc.) are **not implemented** -- they're listed
+in the spec as optional, and the read-only set above already satisfies
+every required acceptance criterion.
+
+### Response format
+
+`{"status":"ok","data": ...}` on success; `{"status":"error","message":"..."}`
+with a real status code (400/404) on failure. `/health` is the one
+deliberate exception, matching the flat shape the spec itself gave as
+its literal example.
+
+### Transfer status -- only states backed by real data
+
+`PENDING` / `TRANSFERRING` / `COMPLETED`, derived directly from
+`highestContiguousCommitted()` vs `totalChunks`. No `FAILED` or
+`RECOVERING` state: this project doesn't durably track a per-transfer
+failure flag, so reporting one would be inventing a state not actually
+backed by data. A checksum failure is still real and visible -- it
+shows up in `transfers_failed` on `/server`, which IS a genuine counter.
+
+### Observability counters (Part 10)
+
+`transfers_started`, `transfers_completed`, `transfers_failed`,
+`bytes_transferred`, `active_connections`, `recovery_count`,
+`integrity_events` -- all incremented at the exact code points they
+describe (see `TransferServer`'s `AtomicLong`/`AtomicInteger` fields),
+never derived or hardcoded. Folded into `/server` rather than a separate
+`/metrics` endpoint, since the spec didn't require one and this keeps
+the endpoint count smaller.
+
+### Security (Part 8)
+
+- The `transfer_id` path segment is decoded and rejected (400) if it's
+  blank, contains `..`, `/`, or `\`, or is implausibly long -- verified
+  directly with a URL-encoded traversal attempt
+  (`/transfers/..%2F..%2Fetc%2Fpasswd` -> 400).
+- The `?type=` filter on `/integrity/events` is validated against the
+  real `IntegrityEventType` enum -- an unrecognized value is a 400, not
+  a silently-empty result.
+- No endpoint accepts a raw filesystem path or exposes file deletion,
+  shell execution, or arbitrary file reads -- there's nothing here for a
+  path-traversal attack to actually reach.
+
+### Real tests executed
+
+**31/31 JUnit 5 tests**, run three consecutive times to confirm the
+result is stable, via `junit-platform-console-standalone`:
+
+```text
+WalTest: 4, FileIntegrityMonitorTest: 10, ResumeAndRecoveryTest: 3,
+TransferIntegrationTest: 6, ManagementApiServerTest: 8
+```
+
+`ManagementApiServerTest` makes real `java.net.http.HttpClient` requests
+against a live `ManagementApiServer`+`TransferServer` -- no mocked HTTP
+layer -- and covers: health/server/transfers/detail/404/integrity events
+(including the type filter and its 400 case)/integrity files/recovery,
+plus the path-traversal rejection.
+
+Two real bugs were found and fixed while writing these tests (both in
+the tests, not the implementation): a fixed-port assumption that raced
+across rapid start/stop cycles (switched to ephemeral ports read back
+via new `getPort()` accessors on both `TransferServer` and
+`ManagementApiServer`), and two places where an HTTP check ran
+immediately after the client's socket closed without waiting for the
+server's accept thread to actually finish processing the final frame --
+fixed by polling `TransferState.isComplete()` instead of assuming it's
+instant.
+
+Also re-ran the real standalone `kill -9` test through the actual
+`main()` entrypoint (now `<tcpPort> <outputDir> <httpPort>`) with the
+HTTP API live throughout: `curl`'d `/health` and `/server` before the
+crash, killed the server process, restarted it, and `curl`'d
+`/recovery` and `/transfers` on the **new** process -- both correctly
+reflected the WAL-recovered, then resumed and completed, transfer.
+Final SHA-256 matched.
+
+### Not yet done (this pass)
+
+- **UDP transport adapter** (Part 4) and the transport abstraction to
+  support it (Part 5) -- not implemented yet.
+- **TLS/secure TCP** (Part 6) -- not implemented yet.
+- Given the scope difference from Phases 1–3, these are being done as
+  separate follow-up passes rather than rushed into this one, per the
+  spec's own "do not implement everything at once" guidance.
+
+### Known limitations
+
+- `HttpServer`'s default executor (single-threaded) is used -- fine for
+  a management API queried occasionally, not load-tested for concurrent
+  API traffic.
+- No authentication on the API -- anyone who can reach the port can read
+  transfer/integrity state. Acceptable for a local management interface
+  at this phase; would need addressing before any real deployment.
+- `/transfers` and `/integrity/events`/`/integrity/files` return every
+  record with no pagination -- fine at this scale, would need it for a
+  long-running server with many transfers or a large monitored tree.
