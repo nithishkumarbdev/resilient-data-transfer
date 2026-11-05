@@ -1,0 +1,50 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "cwagent"
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "cpu": {
+        "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+        "totalcpu": true,
+        "metrics_collection_interval": 60
+      },
+      "mem": {
+        "measurement": ["mem_used_percent"],
+        "metrics_collection_interval": 60
+      },
+      "disk": {
+        "measurement": ["disk_used_percent"],
+        "resources": ["/", "/opt/protobuf-transfer"],
+        "metrics_collection_interval": 60
+      },
+      "diskio": {
+        "measurement": ["diskio_io_time"],
+        "metrics_collection_interval": 60
+      },
+      "net": {
+        "measurement": ["net_bytes_sent", "net_bytes_recv"],
+        "metrics_collection_interval": 60
+      }
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/opt/protobuf-transfer/logs/application.log",
+            "log_group_name": "/protobuf-transfer/application",
+            "log_stream_name": "{instance_id}",
+            "timestamp_format": "%Y-%m-%dT%H:%M:%S"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=Protobuf File Transfer System (TCP/TLS/UDP + WAL + FIM + HTTP API)
+After=network.target
+
+[Service]
+Type=simple
+User=protobuf-transfer
+Group=protobuf-transfer
+WorkingDirectory=/opt/protobuf-transfer/app
+EnvironmentFile=/opt/protobuf-transfer/config/app.env
+ExecStart=/usr/bin/java -cp /opt/protobuf-transfer/app/classes:/opt/protobuf-transfer/app/lib/* \
+    com.nithish.filetransfer.TransferServer ${TCP_PORT} /opt/protobuf-transfer/data ${HTTP_PORT} ${UDP_PORT}
+Restart=on-failure
+RestartSec=5
+
+# Hardening: this service has no reason to touch anything outside its own data/log directories.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/protobuf-transfer/data /opt/protobuf-transfer/logs /opt/protobuf-transfer/wal
+ProtectHome=true
+
+StandardOutput=append:/opt/protobuf-transfer/logs/service-stdout.log
+StandardError=append:/opt/protobuf-transfer/logs/service-stderr.log
+
+[Install]
+WantedBy=multi-user.target
