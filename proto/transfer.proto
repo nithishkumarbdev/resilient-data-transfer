@@ -7,12 +7,17 @@ option java_multiple_files = true;
 
 // Sent once, before any chunks, so the receiver knows what to expect
 // and can pre-allocate the output file at the correct size.
+// chunk_size matters for more than the sender's convenience: the
+// receiver computes each chunk's file offset as sequence_number *
+// chunk_size, so TCP and UDP -- which deliberately use different chunk
+// sizes (see UdpTransferClient) -- must each declare their own.
 message FileMetadata {
   string transfer_id = 1;
   string filename = 2;
   int64 total_size = 3;
   int32 total_chunks = 4;
   string file_checksum = 5; // SHA-256 hex digest of the whole file
+  int32 chunk_size = 6;
 }
 
 // One slice of the file. sequence_number lets the receiver place it at
@@ -42,16 +47,32 @@ message ResumeResponse {
   int32 last_committed_sequence = 2;
 }
 
+// Application-level acknowledgement for the UDP transport. TCP's
+// transport already guarantees delivery, so it never needs this;
+// UDP has no such guarantee, so reliability -- including "did my
+// datagram arrive?" -- has to be built at this layer.
+// sequence_number = -1 acknowledges FileMetadata specifically
+// (i.e. "the transfer has started, you may send chunk 0").
+message UdpAck {
+  string transfer_id = 1;
+  int32 sequence_number = 2;
+}
+
 // Every frame on the wire is one of these. A `oneof` in protobuf means
 // exactly one of the listed fields is set per message — this is how we
 // carry several different message shapes over a single stream without
-// needing a separate "message type" byte of our own.
+// needing a separate "message type" byte of our own. Over UDP, each
+// datagram carries exactly one TransferMessage with nothing extra
+// needed for framing -- unlike TCP, UDP already preserves message
+// boundaries per datagram, so FramingUtils' length-prefix scheme is a
+// TCP-only concern.
 message TransferMessage {
   oneof payload {
     FileMetadata metadata = 1;
     FileChunk chunk = 2;
     ResumeRequest resume_request = 3;
     ResumeResponse resume_response = 4;
+    UdpAck ack = 5;
   }
 }
 
@@ -71,6 +92,8 @@ message WalTransferStart {
   int64 total_size = 3;
   int32 total_chunks = 4;
   string file_checksum = 5;
+  int32 chunk_size = 6;
+  string transport = 7; // "TCP" or "UDP" -- which transport this transfer arrived on, for the API to report honestly
 }
 
 // Written only after a chunk's bytes are durably applied to the

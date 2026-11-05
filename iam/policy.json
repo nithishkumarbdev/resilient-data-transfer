@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublishApplicationAndHostMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": ["ProtobufTransferSystem", "CWAgent"]
+        }
+      }
+    },
+    {
+      "Sid": "ShipApplicationLogsToOneLogGroup",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/protobuf-transfer/application:*"
+    }
+  ]
+}
