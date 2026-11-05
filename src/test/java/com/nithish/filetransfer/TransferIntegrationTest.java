@@ -156,6 +156,7 @@ class TransferIntegrationTest {
                     .setTotalSize(content.length)
                     .setTotalChunks(1)
                     .setFileChecksum(ChecksumUtils.sha256Hex(content))
+                    .setChunkSize(FileChunker.DEFAULT_CHUNK_SIZE)
                     .build();
             FramingUtils.writeFrame(out,
                     TransferMessage.newBuilder().setMetadata(metadata).build().toByteArray());

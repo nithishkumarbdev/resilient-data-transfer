@@ -35,7 +35,8 @@ public final class RecoveryManager {
                 Path outputPath = outputDir.resolve(start.getFilename());
                 transfers.put(start.getTransferId(), new TransferState(
                         start.getTransferId(), start.getFilename(), start.getTotalSize(),
-                        start.getTotalChunks(), start.getFileChecksum(), outputPath));
+                        start.getTotalChunks(), start.getFileChecksum(), outputPath,
+                        start.getChunkSize(), start.getTransport()));
 
             } else if (entry.hasChunkCommitted()) {
                 WalChunkCommitted committed = entry.getChunkCommitted();

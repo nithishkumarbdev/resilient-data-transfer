@@ -3,11 +3,14 @@ package com.nithish.filetransfer;
 import com.google.protobuf.ByteString;
 import com.nithish.filetransfer.proto.FileChunk;
 import com.nithish.filetransfer.proto.FileMetadata;
+import com.nithish.filetransfer.proto.ResumeRequest;
+import com.nithish.filetransfer.proto.ResumeResponse;
 import com.nithish.filetransfer.proto.TransferMessage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
@@ -15,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -76,7 +80,8 @@ class ResumeAndRecoveryTest {
             FileMetadata metadata = FileMetadata.newBuilder()
                     .setTransferId(transferId).setFilename("dup.txt")
                     .setTotalSize(content.length).setTotalChunks(chunks.size())
-                    .setFileChecksum(ChecksumUtils.sha256Hex(input)).build();
+                    .setFileChecksum(ChecksumUtils.sha256Hex(input))
+                    .setChunkSize(FileChunker.DEFAULT_CHUNK_SIZE).build();
             FramingUtils.writeFrame(out, TransferMessage.newBuilder().setMetadata(metadata).build().toByteArray());
 
             // Send chunk 0 three times, simulating a retransmission.
@@ -140,6 +145,66 @@ class ResumeAndRecoveryTest {
         assertNotNull(outcomeRef.get());
         assertTrue(outcomeRef.get().success);
         assertArrayEquals(data, Files.readAllBytes(outputDir.resolve("resume.dat")));
+    }
+
+    @Test
+    @DisplayName("A ResumeRequest for an unknown transfer_id lets the SAME connection continue with fresh metadata + chunks")
+    void resumeWithUnknownTransferId_continuesOnSameConnection() throws Exception {
+        // Regression test: this exact path was broken until now -- the server
+        // used to close the connection immediately after reporting "unknown
+        // transfer_id" (-1), but TransferClient's resume logic is designed to
+        // respond to that -1 by sending fresh FileMetadata on the SAME
+        // connection. Found via a real kill -9 test where the metadata write
+        // succeeded locally (client-side) but the server died before ever
+        // processing/WAL-logging it -- so the client's next attempt asked to
+        // resume a transfer_id the server had genuinely never seen.
+        Path outputDir = Files.createTempDirectory("resume-test-out");
+        Path inputDir = Files.createTempDirectory("resume-test-in");
+        server = new TransferServer(PORT, outputDir);
+        server.start();
+
+        Path input = inputDir.resolve("unknown-resume.txt");
+        Files.writeString(input, "content for the unknown-transfer-id resume test");
+        String transferId = UUID.randomUUID().toString(); // never registered with the server
+        byte[] content = Files.readAllBytes(input);
+        List<byte[]> chunks = FileChunker.chunkFile(input.toString(), FileChunker.DEFAULT_CHUNK_SIZE);
+
+        try (Socket socket = new Socket("localhost", PORT);
+             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+             DataInputStream in = new DataInputStream(socket.getInputStream())) {
+
+            // 1. Ask to resume a transfer the server has never heard of.
+            FramingUtils.writeFrame(out, TransferMessage.newBuilder()
+                    .setResumeRequest(ResumeRequest.newBuilder().setTransferId(transferId).build())
+                    .build().toByteArray());
+
+            byte[] responseFrame = FramingUtils.readFrame(in);
+            assertNotNull(responseFrame);
+            ResumeResponse response = TransferMessage.parseFrom(responseFrame).getResumeResponse();
+            assertEquals(-1, response.getLastCommittedSequence(), "Server should report it has no record of this transfer");
+
+            // 2. On the SAME connection, send fresh metadata + all chunks.
+            FileMetadata metadata = FileMetadata.newBuilder()
+                    .setTransferId(transferId).setFilename("unknown-resume.txt")
+                    .setTotalSize(content.length).setTotalChunks(chunks.size())
+                    .setFileChecksum(ChecksumUtils.sha256Hex(input))
+                    .setChunkSize(FileChunker.DEFAULT_CHUNK_SIZE).build();
+            FramingUtils.writeFrame(out, TransferMessage.newBuilder().setMetadata(metadata).build().toByteArray());
+
+            for (int i = 0; i < chunks.size(); i++) {
+                FileChunk chunk = FileChunk.newBuilder()
+                        .setTransferId(transferId).setSequenceNumber(i)
+                        .setData(ByteString.copyFrom(chunks.get(i)))
+                        .setChunkChecksum(ChecksumUtils.sha256Hex(chunks.get(i))).build();
+                FramingUtils.writeFrame(out, TransferMessage.newBuilder().setChunk(chunk).build().toByteArray());
+            }
+        }
+
+        waitUntil(() -> {
+            TransferState state = server.getTransferState(transferId);
+            return state != null && state.isComplete();
+        });
+        assertArrayEquals(content, Files.readAllBytes(outputDir.resolve("unknown-resume.txt")));
     }
 
     // --- helpers ---

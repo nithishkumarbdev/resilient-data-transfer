@@ -192,6 +192,7 @@ public final class ManagementApiServer {
         m.put("total_chunks", s.totalChunks);
         m.put("committed_chunks", s.highestContiguousCommitted() + 1);
         m.put("status", status(s));
+        m.put("transport", s.transport); // real field, set once at registration -- never guessed
         return m;
     }
 

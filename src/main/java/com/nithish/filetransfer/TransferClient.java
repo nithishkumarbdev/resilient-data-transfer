@@ -58,6 +58,45 @@ public class TransferClient {
      */
     public static TransferOutcome sendFileWithResume(String host, int port, Path filepath,
                                                        int maxRetries, long chunkDelayMillis) throws IOException {
+        return sendFileWithResume(filepath, maxRetries, chunkDelayMillis, () -> new Socket(host, port));
+    }
+
+    /**
+     * TLS variant: identical resume/retry protocol, the only difference is
+     * how the Socket itself gets created. sslContext must come from a real
+     * keystore/truststore (see TlsContextFactory) -- there's no "skip
+     * verification" path here.
+     */
+    public static TransferOutcome sendFileWithResumeTls(String host, int tlsPort, Path filepath,
+                                                          int maxRetries, long chunkDelayMillis,
+                                                          javax.net.ssl.SSLContext sslContext) throws IOException {
+        javax.net.ssl.SSLSocketFactory factory = sslContext.getSocketFactory();
+        return sendFileWithResume(filepath, maxRetries, chunkDelayMillis, () -> {
+            javax.net.ssl.SSLSocket socket = (javax.net.ssl.SSLSocket) factory.createSocket(host, tlsPort);
+            // Hostname verification is NOT on by default for SSLSocket -- explicitly
+            // enabling it is what actually checks the certificate's identity against
+            // the hostname we connected to, not just that the cert chains to a trusted root.
+            javax.net.ssl.SSLParameters params = socket.getSSLParameters();
+            params.setEndpointIdentificationAlgorithm("HTTPS");
+            socket.setSSLParameters(params);
+            socket.startHandshake(); // fail fast with a clear cause before any protocol bytes are sent
+            return socket;
+        });
+    }
+
+    /**
+     * Resume-aware send: if a connection fails partway through (e.g. the
+     * server crashed), reconnects, asks the server where it actually got
+     * to via a ResumeRequest, and continues from the next required chunk
+     * instead of restarting from zero or assuming the client's own guess
+     * about what was sent is what actually landed durably.
+     *
+     * chunkDelayMillis is a TEST-ONLY knob (0 in normal use) -- it exists
+     * purely to make a mid-transfer crash reproducible on demand instead
+     * of racing a real crash against however fast localhost happens to be.
+     */
+    private static TransferOutcome sendFileWithResume(Path filepath, int maxRetries, long chunkDelayMillis,
+                                                        SocketSupplier socketSupplier) throws IOException {
         if (!Files.exists(filepath)) {
             throw new IOException("File not found: " + filepath);
         }
@@ -74,7 +113,7 @@ public class TransferClient {
         IOException lastError = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
-            try (Socket socket = new Socket(host, port);
+            try (Socket socket = socketSupplier.get();
                  DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                  DataInputStream in = new DataInputStream(socket.getInputStream())) {
 
@@ -127,6 +166,11 @@ public class TransferClient {
         throw new IOException("Transfer failed after " + (maxRetries + 1) + " attempt(s)", lastError);
     }
 
+    @FunctionalInterface
+    private interface SocketSupplier {
+        Socket get() throws IOException;
+    }
+
     public static final class TransferOutcome {
         public final String transferId;
         public final boolean success;
@@ -147,6 +191,7 @@ public class TransferClient {
                 .setTotalSize(totalSize)
                 .setTotalChunks(totalChunks)
                 .setFileChecksum(fileChecksum)
+                .setChunkSize(FileChunker.DEFAULT_CHUNK_SIZE)
                 .build();
         FramingUtils.writeFrame(out, TransferMessage.newBuilder().setMetadata(metadata).build().toByteArray());
     }

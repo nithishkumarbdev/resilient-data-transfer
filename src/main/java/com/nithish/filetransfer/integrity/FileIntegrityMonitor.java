@@ -1,6 +1,7 @@
 package com.nithish.filetransfer.integrity;
 
 import com.nithish.filetransfer.ChecksumUtils;
+import com.nithish.filetransfer.metrics.MetricsPublisher;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -53,6 +54,12 @@ public final class FileIntegrityMonitor {
     private ScheduledExecutorService debounceExecutor;
     private Thread watchThread;
     private volatile boolean running;
+    private volatile MetricsPublisher metrics; // nullable -- unset means no CloudWatch/metrics wiring, which is the default
+
+    /** Optional: wire a MetricsPublisher so every integrity event also increments the real IntegrityEvents metric. */
+    public void setMetricsPublisher(MetricsPublisher metrics) {
+        this.metrics = metrics;
+    }
 
     private FileIntegrityMonitor(Path root, BaselineManager baseline, IntegrityEventStore eventStore, Set<String> excludedFileNames) {
         this.root = root.toAbsolutePath().normalize();
@@ -156,9 +163,12 @@ public final class FileIntegrityMonitor {
                     }
                     BaselineManager.Entry entry = known.get(key);
                     if (entry == null) {
+                        // Baseline updated BEFORE the event is recorded, deliberately: once
+                        // a reader observes the event (e.g. via polling the event log), the
+                        // baseline change must already be visible too -- not racing behind it.
+                        baseline.update(key, currentHash, Files.size(file));
                         recordEvent(IntegrityEventType.FILE_CREATED, key, null, currentHash,
                                 "detected during startup reconciliation");
-                        baseline.update(key, currentHash, Files.size(file));
                     } else if (!entry.sha256.equals(currentHash)) {
                         recordEvent(IntegrityEventType.FILE_MODIFIED, key, entry.sha256, currentHash,
                                 "detected during startup reconciliation");
@@ -169,9 +179,9 @@ public final class FileIntegrityMonitor {
 
         for (Path key : known.keySet()) {
             if (!seenOnDisk.contains(key)) {
+                baseline.remove(key);
                 recordEvent(IntegrityEventType.FILE_DELETED, key, known.get(key).sha256, null,
                         "detected during startup reconciliation");
-                baseline.remove(key);
             }
         }
     }
@@ -274,8 +284,9 @@ public final class FileIntegrityMonitor {
 
         Optional<BaselineManager.Entry> known = baseline.get(path);
         if (known.isEmpty()) {
-            recordEvent(IntegrityEventType.FILE_CREATED, path, null, currentHash, "new file detected");
+            // Baseline first, event second -- see reconcile()'s comment on why.
             baseline.update(path, currentHash, Files.size(path));
+            recordEvent(IntegrityEventType.FILE_CREATED, path, null, currentHash, "new file detected");
         } else if (!known.get().sha256.equals(currentHash)) {
             recordEvent(IntegrityEventType.FILE_MODIFIED, path, known.get().sha256, currentHash,
                     "content changed vs baseline -- integrity violation");
@@ -287,8 +298,8 @@ public final class FileIntegrityMonitor {
     private void handleDelete(Path path) throws IOException {
         Optional<BaselineManager.Entry> known = baseline.get(path);
         if (known.isPresent()) {
-            recordEvent(IntegrityEventType.FILE_DELETED, path, known.get().sha256, null, "file removed");
             baseline.remove(path);
+            recordEvent(IntegrityEventType.FILE_DELETED, path, known.get().sha256, null, "file removed");
         }
         // deleting something never in the baseline isn't interesting to report
     }
@@ -297,9 +308,13 @@ public final class FileIntegrityMonitor {
         IntegrityEvent event = new IntegrityEvent(System.currentTimeMillis(), path, type, oldHash, newHash, message);
         eventStore.append(event);
         switch (type) {
-            case FILE_CREATED -> System.out.println("File created: " + path);
-            case FILE_DELETED -> System.out.println("File deleted: " + path);
-            case FILE_MODIFIED -> System.out.println("Integrity violation detected: " + path + " (" + message + ")");
+            case FILE_CREATED -> com.nithish.filetransfer.logging.AppLog.info("file_created", "path", path.toString());
+            case FILE_DELETED -> com.nithish.filetransfer.logging.AppLog.info("file_deleted", "path", path.toString());
+            case FILE_MODIFIED -> com.nithish.filetransfer.logging.AppLog.warn("integrity_violation_detected",
+                    "path", path.toString(), "message", message);
+        }
+        if (metrics != null) {
+            metrics.incrementCounter("IntegrityEvents", 1, java.util.Map.of("EventType", type.name()));
         }
     }
 
