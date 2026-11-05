@@ -14,6 +14,7 @@
     <maven.compiler.target>17</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <protobuf.version>3.21.12</protobuf.version>
+    <aws.sdk.version>2.25.40</aws.sdk.version>
   </properties>
 
   <dependencies>
@@ -21,6 +22,18 @@
       <groupId>com.google.protobuf</groupId>
       <artifactId>protobuf-java</artifactId>
       <version>${protobuf.version}</version>
+    </dependency>
+    <!-- Only needed for CloudWatchMetricsPublisher. NOT present/compiled in
+         the sandbox this project was developed in (no Maven Central access
+         there) -- CloudWatchMetricsPublisher.java is unverified until you
+         run `mvn compile` yourself with this dependency resolved. The rest
+         of the application has no compile-time dependency on it: see
+         MetricsPublisherFactory, which loads this class via reflection and
+         falls back to local logging if it's absent or fails to construct. -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>cloudwatch</artifactId>
+      <version>${aws.sdk.version}</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>

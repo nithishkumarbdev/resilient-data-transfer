@@ -80,7 +80,7 @@ mvn test
 
 Terminal 1 (receiver):
 ```bash
-mvn compile exec:java -Dexec.mainClass="com.nithish.filetransfer.TransferServer" -Dexec.args="9000 /tmp/received 8080"
+mvn compile exec:java -Dexec.mainClass="com.nithish.filetransfer.TransferServer" -Dexec.args="9000 /tmp/received 8080 9001"
 ```
 
 Terminal 2 (sender):
@@ -615,3 +615,509 @@ Final SHA-256 matched.
 - `/transfers` and `/integrity/events`/`/integrity/files` return every
   record with no pagination -- fine at this scale, would need it for a
   long-running server with many transfers or a large monitored tree.
+
+---
+
+## Phase 4 (Part 4) — UDP Transport
+
+Adds a second transport, alongside TCP, feeding the exact same
+WAL/recovery/FIM/API system. **The claim here is precise: UDP itself is
+not reliable; this project implements reliability on top of it at the
+application layer.** TCP's transport already guarantees ordered,
+lossless delivery; UDP guarantees nothing, so sequence numbers, ACKs,
+timeouts, retries, and duplicate handling all had to be built by hand.
+
+### The refactor this required: `TransferProcessor`
+
+Before adding UDP, the "is this chunk safe to keep" logic (duplicate
+detection, checksum validation, file write, WAL commit, FIM
+integration, completion check) lived entirely inside `TransferServer`.
+Adding UDP without duplicating all of that would have meant either a
+second copy of the durability logic (explicitly forbidden by this
+phase's spec) or UDP silently bypassing WAL/FIM. So that logic was
+extracted into a new transport-agnostic `TransferProcessor`:
+
+```text
+                    TransferProcessor
+                 (WAL, transfers map, FIM,
+                  chunk validation & commit)
+                    /              \
+                   /                \
+          TransferServer      UdpTransferServer
+             (TCP framing,      (datagram framing,
+              length-prefix)     ACK/retry/timeout)
+```
+
+One `WalWriter`, one `Map<transfer_id, TransferState>`, one
+`FileIntegrityMonitor` instance -- a transfer started over UDP and one
+started over TCP are both just entries in the same map, replayed from
+the same WAL on restart. `TransferServer`'s public constructors and
+getters are unchanged (backward compatible with every earlier test);
+internally it now just delegates to a `TransferProcessor` it owns, and
+exposes it via `getProcessor()` so `UdpTransferServer` can share it.
+
+### Why UDP needed its own message design (mostly reused, one real addition)
+
+`FileMetadata` and `FileChunk` are reused as-is over UDP -- no second
+schema. Two additions were genuinely necessary:
+
+- **`chunk_size` on `FileMetadata`** (and on the internal
+  `WalTransferStart` WAL entry). TCP and UDP deliberately use
+  *different* chunk sizes (below), and a chunk's file offset is
+  `sequence_number * chunk_size` -- that formula silently breaks if the
+  chunk size isn't the one this specific transfer actually declared.
+  This used to be a hardcoded constant; it's now per-transfer state.
+- **`UdpAck`**, added as one more branch of the existing
+  `TransferMessage` oneof -- not a new top-level protocol. TCP never
+  needed an application-level ack (the transport already guarantees
+  delivery); UDP does, for literally everything.
+
+A UDP datagram carries exactly one `TransferMessage` with no framing
+needed at all -- unlike TCP, UDP already preserves message boundaries
+per datagram, so `FramingUtils`' length-prefix scheme is a TCP-only
+concern.
+
+### Chunk size: 1024 bytes, not TCP's 64 KB
+
+A 64 KB UDP datagram would almost certainly fragment at the IP layer,
+and if any one fragment is lost, the whole datagram is gone with no
+partial-delivery signal -- exactly the kind of hidden reliance on
+fragmentation this phase's spec explicitly warns against.
+`UdpTransferClient.UDP_CHUNK_SIZE = 1024` keeps a whole chunk, plus its
+protobuf/field overhead, safely under a typical 1500-byte Ethernet MTU.
+
+### Reliability: stop-and-wait, deliberately simple
+
+```text
+send DATA(seq=N)
+      |
+      v
+wait up to timeoutMillis for ACK(seq=N)
+      |
+   +--+--+
+   |     |
+  yes    no (timeout)
+   |     |
+   v     v
+ send   retry (bounded by maxRetries)
+ N+1     |
+         v
+   retries exhausted -> IOException, transfer fails
+```
+
+One outstanding chunk at a time, not a sliding window -- the spec
+explicitly asked for correctness and explainability over throughput
+here. An ACK carrying `sequence_number = -1` specifically acknowledges
+`FileMetadata` (i.e. "transfer registered, send chunk 0").
+
+### Duplicate handling -- the same mechanism that makes a lost ACK self-heal
+
+A duplicate arrives whenever a client's ACK was lost and it retried a
+chunk the server already committed. `TransferProcessor.processChunk`
+already had exactly the check needed (`state.isCommitted(seq)`, shared
+with TCP's resume logic) -- UDP just re-sends the ACK for an already-committed
+chunk instead of treating it as an error. This was verified directly: a
+chunk sent twice results in one WAL commit, two "duplicate chunk
+ignored" log lines, and a file that is not corrupted or doubled in size.
+
+### Out-of-order handling -- inherited "for free" from Phase 2
+
+Chunks are written by seek+offset, not by append, and completion is
+tracked via `highestContiguousCommitted()` -- the exact same properties
+that make TCP resume safe already make UDP's chunk processing
+order-independent. Chunks 0, 2, 1 (sent deliberately out of sequence,
+bypassing the client's normal stop-and-wait discipline) were verified
+to assemble into the correct file. No separate out-of-order buffering
+logic was needed or written.
+
+### WAL integration -- no second durability system
+
+`UdpTransferServer.handlePacket` calls the identical
+`TransferProcessor.processChunk`/`finalizeIfComplete` methods TCP uses.
+The durability boundary is unchanged: a chunk is only ACKed after its
+bytes are fsynced to the file AND its `WalChunkCommitted` record is
+fsynced to the WAL. Verified directly: a UDP transfer interrupted after
+2 of 3 chunks, followed by a full `TransferProcessor`/`UdpTransferServer`
+restart against the same output directory, correctly recovered
+`transport=UDP`, `chunk_size=10` (the test's small value), and
+`highestContiguousCommitted() == 1` from the WAL alone -- then accepted
+the remaining chunk and completed correctly.
+
+### HTTP API integration -- real field, not faked
+
+`TransferState` now carries a real `transport` field ("TCP" or "UDP"),
+set once at registration from the value the transport layer actually
+passed in, persisted through the WAL, and surfaced as
+`"transport":"TCP"` / `"transport":"UDP"` in `/transfers` and
+`/transfers/{id}` -- verified with a real transfer sent over UDP,
+queried through the same `ManagementApiServer` TCP transfers use.
+
+### Real tests executed
+
+**39/39 JUnit 5 tests, run three consecutive full-suite times, zero
+failures** (`UdpTransferTest` adds 8: normal transfer, multi-chunk
+assembly, checksum-mismatch rejection with correct resend, duplicate/
+lost-ack self-heal, timeout+bounded-retry-exhaustion with an exact
+retry-count assertion, out-of-order assembly, WAL recovery after a
+restart, and the API transport-field check).
+
+A real, previously-flaky pre-existing bug was found and fixed along
+the way (unrelated to UDP itself): `FileIntegrityMonitor` recorded an
+event *before* updating the baseline in four places, creating a real
+TOCTOU race for any reader polling the event log and then immediately
+checking the baseline. Reordered to update the baseline first in all
+four sites; the previously ~25%-flaky `deletedFile_isDetected` test
+passed 8/8 in isolation afterward, and 3/3 full-suite runs stayed clean.
+
+Also ran, for real, outside JUnit: a UDP transfer through the actual
+`main()` entrypoint, a `kill -9` of the TCP server mid-transfer with
+restart and resume, and a `curl /transfers` on the **restarted** server
+showing both the UDP-completed and the crash-recovered TCP-completed
+transfer with correct `transport` fields and matching SHA-256 checksums.
+
+### Known limitations
+
+- Stop-and-wait only -- one outstanding datagram at a time. A sliding
+  window would improve throughput but was explicitly out of scope for
+  this pass.
+- No congestion control -- a real concern at scale, not attempted here.
+- `UdpTransferServer` processes packets on a single thread, matching
+  the existing TCP server's one-connection-at-a-time model; concurrent
+  multi-client UDP traffic isn't load-tested.
+- No performance benchmarking was done in this pass -- the spec is
+  explicit that correctness comes before throughput measurement, and
+  this pass stopped at correctness.
+
+### Still not done
+
+TLS/secure TCP (the remaining piece of Phase 4) -- not implemented in
+this pass either.
+
+---
+
+## Phase 4 (Part 5) — TLS-Secured TCP
+
+Adds an optional TLS-secured variant of the existing TCP transport. Plain
+TCP is unchanged and still available — **TLS is additive, not a
+replacement.** The claim here is precise and bounded: standard JDK TLS
+(`javax.net.ssl`) protecting the existing TCP/Protobuf transfer protocol,
+nothing more. No custom cryptography, no trust-all shortcuts, no
+production PKI claims.
+
+### Architecture: TLS is just a different kind of socket
+
+```text
+Transfer Manager (TransferProcessor)
+         |
+      Transport
+         |
+    +----+----+
+    |         |
+   TCP       UDP
+    |
+ +--+--+
+ |     |
+plain TLS
+Socket SSLSocket
+```
+
+`SSLServerSocket.accept()` returns an `SSLSocket`, and `SSLSocket extends
+Socket`. That single fact is why nothing above the socket layer needed to
+change: `TransferServer.handleConnection(Socket socket)` is used
+completely unchanged for both plain and TLS connections — it has no idea
+which one it's holding. Chunking, Protobuf serialization, WAL commits,
+resume state, SHA-256 verification, and FIM integration are all
+byte-for-byte the same code path either way.
+
+### What's new
+
+- **`tls/TlsContextFactory`** — builds `SSLContext` from a real PKCS12
+  keystore (server) or truststore (client) using standard
+  `KeyManagerFactory`/`TrustManagerFactory` APIs. No custom
+  `TrustManager`, no `HostnameVerifier` that always returns true —
+  every rejection test in `TlsTransferTest` would pass for the wrong
+  reason if either existed.
+- **`TransferServer.startTls(tlsPort, sslContext)`** — an additive
+  second listener, bound to its own port (TLS and plain TCP are never
+  multiplexed on one port). Explicitly calls `startHandshake()` right
+  after `accept()`, in its own try/catch, so one client's bad handshake
+  is logged and dropped without affecting the accept loop or any other
+  connection.
+- **`TransferClient.sendFileWithResumeTls(...)`** — the *exact same*
+  resume/retry method as plain TCP, refactored to take a `Socket`-creation
+  strategy instead of hardcoding `new Socket(...)`. The TLS variant
+  additionally sets `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`
+  before the handshake — **not on by default** for `SSLSocket`, and the
+  actual check that validates the certificate's identity against the
+  hostname connected to, not just that it chains to a trusted root.
+- **`generate-dev-certs.sh`** — reproducible `keytool` commands for a
+  local self-signed dev certificate. Never commit the `.p12` files it
+  produces; run it locally, or let `TestCertGenerator` (test-only) shell
+  out to real `keytool` per test run.
+
+### Configuration: environment variables only
+
+```text
+TLS_ENABLED=true
+TLS_PORT=9443
+TLS_KEYSTORE_PATH=/path/to/server-keystore.p12
+TLS_KEYSTORE_PASSWORD=changeit
+```
+
+Never CLI arguments, never hardcoded — a keystore password in a CLI arg
+ends up in shell history and `ps` output; in Java source it ends up in
+version control. `main()` only enables TLS when `TLS_ENABLED=true`; a
+plain-TCP-only server run is unaffected by any of this.
+
+### Certificate setup (reproducible, no secrets committed)
+
+```bash
+./generate-dev-certs.sh ./certs
+# writes ./certs/server-keystore.p12 and ./certs/client-truststore.p12,
+# both dev-only, both .gitignore'd -- never commit them
+
+TLS_ENABLED=true TLS_PORT=9443 \
+  TLS_KEYSTORE_PATH=./certs/server-keystore.p12 TLS_KEYSTORE_PASSWORD=changeit \
+  java -cp target/classes:... com.nithish.filetransfer.TransferServer 9000 /tmp/received 8080 9001
+```
+
+The client needs the matching truststore (`TlsContextFactory.clientContext(...)`)
+built from the exact same certificate.
+
+### TLS protocol actually negotiated (measured, not assumed)
+
+Verified directly against a running server:
+
+```text
+Negotiated protocol: TLSv1.3
+Negotiated cipher suite: TLS_AES_256_GCM_SHA384
+```
+
+`TlsContextFactory.PROTOCOL = "TLSv1.3"` requests this explicitly rather
+than hand-picking cipher suites — the JDK's own secure defaults choose
+the cipher.
+
+### Certificate validation — no shortcuts, verified by making it fail correctly
+
+Two *different* rejection paths were tested, on purpose, because they
+protect against different things:
+
+- **Untrusted certificate**: a client with an empty truststore (trusts
+  nothing) fails the handshake with a real `SSLException` in the cause
+  chain. The server logs the failed handshake and stays healthy — a
+  *different* client with the correct truststore was verified to
+  succeed immediately afterward, on the same server, same JVM run.
+- **Hostname/identity mismatch**: a server presenting a certificate for
+  `wronghost.example` (not `localhost`), with a client that trusts that
+  *exact* certificate (so the trust chain itself is fine) but connects
+  to `"localhost"` — endpoint identification correctly rejects this on
+  the identity mismatch specifically, not the trust chain. This is the
+  check `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`
+  turns on; without it, this connection would have silently succeeded.
+
+### A real bug this phase's testing found — in Phase 2's resume protocol, not TLS
+
+A real end-to-end `kill -9` test against a TLS-enabled server (killing it
+right as the client's metadata write returned locally but before the
+server had necessarily processed it) surfaced a genuine, previously
+untested bug: when a `ResumeRequest` comes in for a transfer_id the
+server has never seen, `handleConnection` was closing the connection
+immediately after sending back `last_committed_sequence = -1` — but
+`TransferClient`'s resume logic is specifically designed to respond to
+that `-1` by sending fresh `FileMetadata` on the *same* connection. Every
+earlier resume/recovery test happened to always hit the "known transfer,
+resume from N" branch; this exact "-1, unknown, continue on the same
+connection" branch had never been exercised before. Fixed by having
+`handleConnection` keep reading from the connection in that case instead
+of returning immediately, with a new deterministic regression test
+(`ResumeAndRecoveryTest.resumeWithUnknownTransferId_continuesOnSameConnection`)
+added specifically for this path. Re-ran the exact real `kill -9`
+scenario that found it afterward — resumed and completed correctly, SHA-256
+matched.
+
+### Real tests executed
+
+**50/50 JUnit 5 tests, 10 consecutive full-suite runs with zero
+failures** after the fixes above (`TlsTransferTest` adds 10: normal
+transfer, plain-TCP-alongside-TLS, multi-chunk, resume-after-restart,
+untrusted-certificate rejection + server-stays-healthy-afterward,
+hostname-mismatch rejection, wrong-password config error, missing-file
+config error, HTTP API coexistence, UDP regression).
+
+Also ran, for real, outside JUnit: the actual `generate-dev-certs.sh`
+script end-to-end; a real `kill -9` of a TLS-enabled server via the
+actual `main()` entrypoint with environment-variable configuration,
+resume, and a final SHA-256 match; and a direct protocol/cipher-suite
+check against a live handshake.
+
+### Known limitations
+
+- Server-authenticated TLS only — no mutual TLS (client certificates).
+  Explicitly out of scope for this pass per the spec's own "don't add
+  mTLS just to increase the feature count" guidance.
+- No user authentication/authorization above the transport layer, no
+  production PKI (self-signed dev certs only), no certificate rotation,
+  no distributed identity management.
+- No plain-TCP-vs-TLS throughput comparison was measured in this pass —
+  the spec explicitly deprioritizes this, and no benchmark numbers are
+  reported here since none were actually run.
+- Test-suite timing (`waitUntil` polling windows, retry budgets) was
+  tuned empirically against this sandbox's behavior under a full
+  50-test concurrent run, not against a fixed SLA — a real CI runner
+  with different resource characteristics may need different margins.
+
+---
+
+## Phase 5 — AWS Deployment, IAM, CloudWatch Observability
+
+**Read this section's structure before the content**: every claim below is
+labeled either ✅ **VERIFIED LOCALLY** (actually run, with real output
+shown) or ⬜ **NOT EXECUTED — requires a real AWS account** (written,
+locally validated for syntax/structure where possible, never applied or
+tested against real AWS). This project's development environment has
+**no AWS credentials, no AWS CLI, and its network policy explicitly
+blocks `amazonaws.com`** — confirmed directly, not assumed. Nothing in
+this section claims otherwise.
+
+### Architecture: AWS wraps the existing application, doesn't replace it
+
+```text
+                     Remote Client
+                         |
+             +-----------+-----------+
+             |           |           |
+            HTTP        TLS          UDP
+             |           |           |
+             v           v           v
+                 +----------------+
+                 |      EC2       |
+                 | Java Server    |   <- same Phases 1-4 code, unmodified
+                 +-------+--------+      except the metrics/logging hooks below
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+             WAL                   FIM
+              |                     |
+              v                     v
+         File Storage         Integrity Events
+              |
+              +----------------------+
+                                     |
+                                     v
+                              CloudWatch Agent (host) + MetricsPublisher (app)
+                                     |
+                       +-------------+-------------+
+                       |             |             |
+                       v             v             v
+                     Logs         Metrics        Alarms
+```
+
+### ✅ VERIFIED LOCALLY — the application-side observability code
+
+**`MetricsPublisher` interface** (`metrics/MetricsPublisher.java`) — every
+metric call in the application goes through this. Three implementations:
+- `LoggingMetricsPublisher` — the local-mode default, logs every metric via
+  `AppLog`, makes zero network calls.
+- `CloudWatchMetricsPublisher` — real AWS SDK v2 code (see the "NOT
+  COMPILED OR TESTED" banner in its own javadoc — this one file genuinely
+  could not be verified in this environment; see below).
+- `MetricsPublisherFactory` — picks based on `CLOUDWATCH_ENABLED`, loading
+  `CloudWatchMetricsPublisher` via **reflection** specifically so the rest
+  of the application has zero compile-time dependency on the AWS SDK.
+
+**Real counters, not invented ones** — `TransferProcessor`, `TransferServer`,
+and `FileIntegrityMonitor` call the publisher at the exact point each
+counter already changes: `TransfersStarted`/`TransfersCompleted`/
+`TransfersFailed`/`BytesTransferred` (already existed from Phase 4's HTTP
+API), plus three genuinely new ones this phase added: `RecoveredTransfers`
+and `WALRecoveryDurationMs` (measured from the real WAL replay in
+`TransferProcessor.initialize()`), `TransferDurationMs` (measured from each
+transfer's real start to its real completion), `ActiveConnections` (gauged
+on every connect/disconnect), and `IntegrityEvents` (incremented from FIM's
+real `recordEvent`, with the real event type as a dimension).
+
+**`AppLog`** (`logging/AppLog.java`) — structured, timestamped,
+`key=value` lines to stdout always, and to a file when `APP_LOG_PATH` is
+set (what the CloudWatch Agent config below tails). Wired into: server
+start, API start, transfer started/completed/failed, WAL recovery, TLS
+handshake failures, FIM file created/deleted/integrity-violation events.
+
+**Test results**: **59/59 real JUnit 5 tests, 3 consecutive full-suite
+runs, zero failures** (9 new: `MetricsIntegrationTest` — 4 tests proving
+real events drive real metrics (a real transfer, a real checksum failure,
+a real restart, a real FIM violation — not synthetic calls);
+`MetricsPublisherFactoryTest` — 2 tests against this environment's actual
+unset `CLOUDWATCH_ENABLED`; `AppLogTest` — 3 tests for format/never-throws).
+
+**The resilience property Part 32 requires — demonstrated for real, not
+just asserted**: ran the actual server with `CLOUDWATCH_ENABLED=true` in
+this environment, where the AWS SDK genuinely isn't on the classpath.
+Captured output:
+```text
+WARN metrics_publisher_fallback reason=java.lang.ClassNotFoundException: com.nithish.filetransfer.metrics.CloudWatchMetricsPublisher
+INFO transfer_started transfer_id=... filename=f5.bin total_size=400000 total_chunks=7 transport=TCP
+INFO transfer_completed transfer_id=... filename=f5.bin duration_ms=187 transport=TCP
+```
+The transfer completed successfully and the SHA-256 matched, despite
+"CloudWatch" being completely unavailable — exactly the required
+behavior, not a simulation of it. Also confirmed the `APP_LOG_PATH` file
+received the identical structured log lines in real time.
+
+**Local mode with CloudWatch disabled** — the default state of every one
+of the 59 tests above, and of every prior phase's test. The application
+has never, in this entire project, required AWS to be reachable to work.
+
+### ⬜ NOT EXECUTED — requires a real AWS account
+
+Everything below was written carefully and validated where a local tool
+exists for that (shown per item), but **no AWS resource was created, no
+metric was actually delivered to CloudWatch, no dashboard or alarm was
+observed firing, and no EC2 instance ran this application.**
+
+| Artifact | What it is | Local validation performed |
+|---|---|---|
+| `terraform/*.tf` | EC2 instance, security group, IAM role + instance profile + policy, CloudWatch log group, dashboard, 4 alarms, SNS topic | Parsed with `terraform-config-inspect` — all 12 resources, 6 outputs, 12 variables recognized, zero diagnostics/errors. **`terraform plan`/`apply` never run** — no AWS credentials to run them with. |
+| `iam/trust-policy.json`, `iam/policy.json` | EC2 assume-role trust policy; least-privilege policy (`cloudwatch:PutMetricData` scoped by namespace condition, `logs:*` scoped to one log group ARN) | Valid JSON (`jq`). **Never attached to a real role or tested against the real CloudWatch/Logs APIs.** |
+| `deploy/protobuf-transfer.service` | systemd unit — runs as a dedicated non-root user, `Restart=on-failure`, `ProtectSystem=strict` | Hand-reviewed against systemd unit syntax. **Never installed or started on a real host.** |
+| `deploy/cloudwatch-agent-config.json` | CloudWatch Agent config — CPU/mem/disk/diskio/net host metrics, one log file collected | Valid JSON (`jq`). **Never loaded by a real agent.** |
+| `deploy/deploy.sh` | End-to-end deployment script (Java install → service user → directories → copy app → optional agent → systemd → health check) | `bash -n` syntax check passed. **Never run against a real instance.** |
+| `deploy/app.env.template` | Environment config template for the systemd `EnvironmentFile` | N/A (plain template). |
+| `CloudWatchMetricsPublisher.java` | Real `PutMetricData` calls via AWS SDK v2 | **Not compiled** — no SDK jar available in this sandbox at all (checked directly: not in apt, Maven Central unreachable). Written from documented API knowledge; run `mvn compile` yourself first thing after pulling this. |
+
+**Before trusting any of the above in a real deployment**: run
+`terraform plan` (review every resource it intends to create), run
+`mvn compile` (confirm `CloudWatchMetricsPublisher` actually compiles
+against the real SDK version in `pom.xml`), and work through Parts
+23-30 of the original Phase 5 spec (real logging/metrics/alarm tests,
+remote TLS/UDP transfers, a real crash/recovery test, and a reboot
+test) against the instance Terraform creates — none of that is
+something this environment could do for you.
+
+### Decisions worth knowing about
+
+- **Parameter Store was not integrated.** The existing environment-variable
+  configuration (already implemented since Phase 4, tested throughout)
+  was judged sufficient for a single-instance deployment. Documented here
+  as a deliberate scope decision, not an oversight — Parameter Store would
+  be a reasonable addition if this grew to multiple instances needing
+  centrally-managed config.
+- **S3/EFS were not introduced.** Local EBS storage (`gp3`, encrypted)
+  backs the WAL/file data, per the spec's explicit "don't add S3 just
+  because this is AWS" guidance. This is instance-attached storage, not
+  distributed storage — documented as a real limitation, not glossed over.
+- **Reflection, not a feature flag, gates `CloudWatchMetricsPublisher`.**
+  This was a direct consequence of this environment lacking the AWS SDK,
+  but it turned into the actual correct design for Part 32's resilience
+  requirement — see `MetricsPublisherFactory`'s javadoc.
+
+### Known limitations
+
+- No mutual TLS, no Parameter Store, no multi-instance/auto-scaling —
+  all explicitly out of scope per the spec.
+- Alarm thresholds (80% CPU, 85% disk, any transfer failure, any
+  integrity violation) are demo values, not derived from load testing.
+  Stated plainly in `terraform/alarms.tf`'s own comments, not just here.
+- `CloudWatchMetricsPublisher.java` is unverified code — real, written
+  carefully against the documented SDK v2 API, but genuinely untested
+  by anyone, including this session.
